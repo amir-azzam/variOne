@@ -1178,6 +1178,14 @@ static void cc1101Probe() {
 
   Serial.println(F("=== CC1101 probe ==="));
   digitalWrite(CSN, HIGH);
+  delay(2);
+
+  // --- Layer 1: is MISO being pulled up by the chip at rest? ---
+  pinMode(MISO_PIN, INPUT);
+  delay(1);
+  int misoIdle = digitalRead(MISO_PIN);
+  Serial.printf("MISO idle = %s  (HIGH expected if chip is powered)\n",
+                misoIdle ? "HIGH" : "LOW");
 
   // SRES reset sequence (CC1101 datasheet §19.1.2)
   digitalWrite(CSN, HIGH); delayMicroseconds(5);
@@ -1194,8 +1202,7 @@ static void cc1101Probe() {
   SPI.endTransaction();
   delay(10);
 
-  // Burst-read status registers (need READ_BURST=0xC0 bit set)
-  auto rd = [&](uint8_t a) -> uint8_t {
+  auto rdStatus = [&](uint8_t a) -> uint8_t {
     SPI.beginTransaction(cfg);
     digitalWrite(CSN, LOW);
     SPI.transfer(a | 0xC0);
@@ -1204,18 +1211,50 @@ static void cc1101Probe() {
     SPI.endTransaction();
     return v;
   };
+  auto wrCfg = [&](uint8_t a, uint8_t v) {
+    SPI.beginTransaction(cfg);
+    digitalWrite(CSN, LOW);
+    SPI.transfer(a & 0x3F);
+    SPI.transfer(v);
+    digitalWrite(CSN, HIGH);
+    SPI.endTransaction();
+  };
+  auto rdCfg = [&](uint8_t a) -> uint8_t {
+    SPI.beginTransaction(cfg);
+    digitalWrite(CSN, LOW);
+    SPI.transfer((a & 0x3F) | 0x80);
+    uint8_t v = SPI.transfer(0);
+    digitalWrite(CSN, HIGH);
+    SPI.endTransaction();
+    return v;
+  };
 
-  uint8_t partnum = rd(0x30);
-  uint8_t version = rd(0x31);
-  bool ok = (partnum == 0x00) && (version == 0x04 || version == 0x14);
+  // --- Layer 2: write/readback on IOCFG2 (address 0x00) ---
+  wrCfg(0x00, 0x29);
+  uint8_t echo = rdCfg(0x00);
+  bool rwOk = (echo == 0x29);
+  Serial.printf("IOCFG2 write=0x29  read=0x%02X  -> %s\n",
+                echo, rwOk ? "BUS OK" : "BUS BAD");
 
+  // --- Layer 3: PARTNUM + VERSION ---
+  uint8_t partnum = rdStatus(0x30);
+  uint8_t version = rdStatus(0x31);
+  bool idOk = (partnum == 0x00) && (version == 0x04 || version == 0x14);
   Serial.printf("PARTNUM=0x%02X  VERSION=0x%02X  -> %s\n",
-                partnum, version, ok ? "OK" : "FAIL");
+                partnum, version, idOk ? "ID OK" : "ID BAD");
+
+  // --- Verdict ---
+  const char* verdict;
+  if (rwOk && idOk)                  verdict = "DETECTED + HEALTHY";
+  else if (rwOk && !idOk)            verdict = "DETECTED, weird ID";
+  else if (!misoIdle)                verdict = "MISO stuck LOW (power/wire)";
+  else                               verdict = "NO CHIP (MOSI/MISO/CSN?)";
+  Serial.printf("-> %s\n", verdict);
 
   char line2[22];
-  snprintf(line2, sizeof(line2), "PN=%02X VER=%02X", partnum, version);
-  triggerReaction(ok ? MOOD_SUCCESS : MOOD_FAIL,
-                  ok ? "CC1101 OK" : "CC1101 err", line2);
+  snprintf(line2, sizeof(line2), "V=%02X rw=%s", version, rwOk ? "ok" : "no");
+  triggerReaction((rwOk && idOk) ? MOOD_SUCCESS : MOOD_FAIL,
+                  (rwOk && idOk) ? "CC1101 OK" : "CC1101 err", line2);
 }
 
 // ============================================================
