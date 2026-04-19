@@ -1169,6 +1169,56 @@ void handleInput(char input) {
 }
 
 // ============================================================
+// CC1101 PROBE — invoked by serial 'c', never runs at boot
+// ============================================================
+
+static void cc1101Probe() {
+  const uint8_t CSN = 27, MISO_PIN = 19;
+  SPISettings cfg(1000000, MSBFIRST, SPI_MODE0);
+
+  Serial.println(F("=== CC1101 probe ==="));
+  digitalWrite(CSN, HIGH);
+
+  // SRES reset sequence (CC1101 datasheet §19.1.2)
+  digitalWrite(CSN, HIGH); delayMicroseconds(5);
+  digitalWrite(CSN, LOW);  delayMicroseconds(10);
+  digitalWrite(CSN, HIGH); delayMicroseconds(45);
+  SPI.beginTransaction(cfg);
+  digitalWrite(CSN, LOW);
+  uint32_t t0 = millis();
+  while (digitalRead(MISO_PIN) == HIGH && millis() - t0 < 50) delayMicroseconds(10);
+  SPI.transfer(0x30);
+  t0 = millis();
+  while (digitalRead(MISO_PIN) == HIGH && millis() - t0 < 50) delayMicroseconds(10);
+  digitalWrite(CSN, HIGH);
+  SPI.endTransaction();
+  delay(10);
+
+  // Burst-read status registers (need READ_BURST=0xC0 bit set)
+  auto rd = [&](uint8_t a) -> uint8_t {
+    SPI.beginTransaction(cfg);
+    digitalWrite(CSN, LOW);
+    SPI.transfer(a | 0xC0);
+    uint8_t v = SPI.transfer(0);
+    digitalWrite(CSN, HIGH);
+    SPI.endTransaction();
+    return v;
+  };
+
+  uint8_t partnum = rd(0x30);
+  uint8_t version = rd(0x31);
+  bool ok = (partnum == 0x00) && (version == 0x04 || version == 0x14);
+
+  Serial.printf("PARTNUM=0x%02X  VERSION=0x%02X  -> %s\n",
+                partnum, version, ok ? "OK" : "FAIL");
+
+  char line2[22];
+  snprintf(line2, sizeof(line2), "PN=%02X VER=%02X", partnum, version);
+  triggerReaction(ok ? MOOD_SUCCESS : MOOD_FAIL,
+                  ok ? "CC1101 OK" : "CC1101 err", line2);
+}
+
+// ============================================================
 // SETUP + LOOP
 // ============================================================
 
@@ -1314,7 +1364,12 @@ void loop() {
 
   // === INPUT ===
   char input = 0;
-  if (Serial.available()) { char c=Serial.read(); if(c=='r') sdPrintAllCreds(); else input=c; }
+  if (Serial.available()) {
+    char c = Serial.read();
+    if      (c == 'r') sdPrintAllCreds();
+    else if (c == 'c') cc1101Probe();
+    else               input = c;
+  }
   if (!input) input = readButtons();
   if (input) { lastInputTime=millis(); handleInput(input); }
 
