@@ -1169,6 +1169,95 @@ void handleInput(char input) {
 }
 
 // ============================================================
+// CC1101 PROBE — invoked by serial 'c', never runs at boot
+// ============================================================
+
+static void cc1101Probe() {
+  const uint8_t CSN = 27, MISO_PIN = 19;
+  SPISettings cfg(1000000, MSBFIRST, SPI_MODE0);
+
+  Serial.println(F("=== CC1101 probe ==="));
+  digitalWrite(CSN, HIGH);
+  delay(2);
+
+  // --- Layer 1: is MISO being pulled up by the chip at rest? ---
+  pinMode(MISO_PIN, INPUT);
+  delay(1);
+  int misoIdle = digitalRead(MISO_PIN);
+  Serial.printf("MISO idle = %s  (HIGH expected if chip is powered)\n",
+                misoIdle ? "HIGH" : "LOW");
+
+  // SRES reset sequence (CC1101 datasheet §19.1.2)
+  digitalWrite(CSN, HIGH); delayMicroseconds(5);
+  digitalWrite(CSN, LOW);  delayMicroseconds(10);
+  digitalWrite(CSN, HIGH); delayMicroseconds(45);
+  SPI.beginTransaction(cfg);
+  digitalWrite(CSN, LOW);
+  uint32_t t0 = millis();
+  while (digitalRead(MISO_PIN) == HIGH && millis() - t0 < 50) delayMicroseconds(10);
+  SPI.transfer(0x30);
+  t0 = millis();
+  while (digitalRead(MISO_PIN) == HIGH && millis() - t0 < 50) delayMicroseconds(10);
+  digitalWrite(CSN, HIGH);
+  SPI.endTransaction();
+  delay(10);
+
+  auto rdStatus = [&](uint8_t a) -> uint8_t {
+    SPI.beginTransaction(cfg);
+    digitalWrite(CSN, LOW);
+    SPI.transfer(a | 0xC0);
+    uint8_t v = SPI.transfer(0);
+    digitalWrite(CSN, HIGH);
+    SPI.endTransaction();
+    return v;
+  };
+  auto wrCfg = [&](uint8_t a, uint8_t v) {
+    SPI.beginTransaction(cfg);
+    digitalWrite(CSN, LOW);
+    SPI.transfer(a & 0x3F);
+    SPI.transfer(v);
+    digitalWrite(CSN, HIGH);
+    SPI.endTransaction();
+  };
+  auto rdCfg = [&](uint8_t a) -> uint8_t {
+    SPI.beginTransaction(cfg);
+    digitalWrite(CSN, LOW);
+    SPI.transfer((a & 0x3F) | 0x80);
+    uint8_t v = SPI.transfer(0);
+    digitalWrite(CSN, HIGH);
+    SPI.endTransaction();
+    return v;
+  };
+
+  // --- Layer 2: write/readback on IOCFG2 (address 0x00) ---
+  wrCfg(0x00, 0x29);
+  uint8_t echo = rdCfg(0x00);
+  bool rwOk = (echo == 0x29);
+  Serial.printf("IOCFG2 write=0x29  read=0x%02X  -> %s\n",
+                echo, rwOk ? "BUS OK" : "BUS BAD");
+
+  // --- Layer 3: PARTNUM + VERSION ---
+  uint8_t partnum = rdStatus(0x30);
+  uint8_t version = rdStatus(0x31);
+  bool idOk = (partnum == 0x00) && (version == 0x04 || version == 0x14);
+  Serial.printf("PARTNUM=0x%02X  VERSION=0x%02X  -> %s\n",
+                partnum, version, idOk ? "ID OK" : "ID BAD");
+
+  // --- Verdict ---
+  const char* verdict;
+  if (rwOk && idOk)                  verdict = "DETECTED + HEALTHY";
+  else if (rwOk && !idOk)            verdict = "DETECTED, weird ID";
+  else if (!misoIdle)                verdict = "MISO stuck LOW (power/wire)";
+  else                               verdict = "NO CHIP (MOSI/MISO/CSN?)";
+  Serial.printf("-> %s\n", verdict);
+
+  char line2[22];
+  snprintf(line2, sizeof(line2), "V=%02X rw=%s", version, rwOk ? "ok" : "no");
+  triggerReaction((rwOk && idOk) ? MOOD_SUCCESS : MOOD_FAIL,
+                  (rwOk && idOk) ? "CC1101 OK" : "CC1101 err", line2);
+}
+
+// ============================================================
 // SETUP + LOOP
 // ============================================================
 
@@ -1314,7 +1403,12 @@ void loop() {
 
   // === INPUT ===
   char input = 0;
-  if (Serial.available()) { char c=Serial.read(); if(c=='r') sdPrintAllCreds(); else input=c; }
+  if (Serial.available()) {
+    char c = Serial.read();
+    if      (c == 'r') sdPrintAllCreds();
+    else if (c == 'c') cc1101Probe();
+    else               input = c;
+  }
   if (!input) input = readButtons();
   if (input) { lastInputTime=millis(); handleInput(input); }
 
