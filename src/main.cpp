@@ -8,13 +8,19 @@
 #include <SPI.h>
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include <RCSwitch.h>
+#include <Adafruit_PN532.h>
 
 // === DISPLAY ===
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 
 // === PIN DEFINITIONS ===
-#define PIN_CC_CS 27
-#define PIN_SD_CS  5
+#define PIN_CC_CS  15
+#define PIN_SD_CS   5
+#define PIN_NFC_SS 27
+#define PIN_NFC_RST 13
 
 // === BUTTONS ===
 #define BTN_LEFT  14
@@ -469,6 +475,223 @@ char etLastUser[33] = {0};
 char etLastPass[33] = {0};
 unsigned long lastEtDraw = 0;
 
+// === SUB-GHZ (CC1101) ===
+RCSwitch rcSwitch = RCSwitch();
+bool cc1101Ok = false;
+
+struct SubGhzCapture {
+  unsigned long value;
+  unsigned int  bitLen;
+  unsigned int  protocol;
+  unsigned int  pulseLen;
+  bool          valid;
+};
+SubGhzCapture sgCapture = {0, 0, 0, 0, false};
+
+#define SG_WAVE_SAMPLES 128
+uint8_t sgWave[SG_WAVE_SAMPLES];
+bool    sgWaveReady = false;
+unsigned long sgLastReceived = 0;
+bool    sgListening = false;
+int     sgPulseCount = 0;
+bool    sgArmed = false;
+unsigned long sgArmTime = 0;
+int     sgBaselineRssi = -100;
+int     sgNoiseFloor = -100;
+#define SG_ARM_WINDOW 3000
+
+uint8_t cc1101ReadReg(uint8_t addr) {
+  digitalWrite(15, LOW);
+  delayMicroseconds(10);
+  SPI.transfer(addr | 0x80);
+  uint8_t val = SPI.transfer(0x00);
+  digitalWrite(15, HIGH);
+  return val;
+}
+
+void initCC1101() {
+  SPI.begin(18, 19, 23, 15);
+  pinMode(15, OUTPUT);
+  digitalWrite(15, HIGH);
+  delay(100);
+
+  // Raw SPI diagnostic — read PARTNUM(0xF0) and VERSION(0xF1)
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  uint8_t partnum = cc1101ReadReg(0xF0);
+  uint8_t version = cc1101ReadReg(0xF1);
+  SPI.endTransaction();
+  Serial.printf("[CC1101] RAW partnum=0x%02X version=0x%02X\n", partnum, version);
+  // Expected: partnum=0x00 version=0x04 or 0x14
+  // All 0xFF = MISO floating (loose wire)
+  // All 0x00 = MOSI/SCK issue
+
+  ELECHOUSE_cc1101.setSpiPin(18, 19, 23, 15);
+  ELECHOUSE_cc1101.setGDO0(4);
+  delay(50);
+  // Skip getCC1101() — raw SPI confirms chip present (partnum=0x00 version=0x14)
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setMHZ(433.92);
+  ELECHOUSE_cc1101.SpiWriteReg(0x00, 0x0E);  // IOCFG0 = carrier sense
+  ELECHOUSE_cc1101.SetRx();
+  cc1101Ok = true;
+  Serial.println("[CC1101] OK");
+}
+
+void captureRawSignal() {
+  // Wait for signal start — 100ms timeout
+  unsigned long t = millis();
+  while (!digitalRead(4) && millis() - t < 100);
+  if (!digitalRead(4)) return;
+
+  // Sample 128 points at 150us each = ~19ms window, higher resolution
+  for (int i = 0; i < SG_WAVE_SAMPLES; i++) {
+    sgWave[i] = digitalRead(4);
+    delayMicroseconds(150);
+  }
+
+  // Count transitions
+  sgPulseCount = 0;
+  for (int i = 1; i < SG_WAVE_SAMPLES; i++)
+    if (sgWave[i] != sgWave[i-1]) sgPulseCount++;
+
+  sgWaveReady    = true;
+  sgLastReceived = millis();
+
+  Serial.printf("[CC1101] pulses=%d\n", sgPulseCount);
+
+  // Car remote (KeeLoq) = 60+ transitions. Doorbells/sensors = <50.
+  if (sgPulseCount >= 18) {
+    sgCapture.valid = true;
+    triggerReaction(MOOD_SUCCESS, "Car remote!", "433MHz");
+  } else {
+    Serial.printf("[CC1101] Ignored (%d pulses, not car remote)\n", sgPulseCount);
+  }
+}
+
+void startSubGhz() {
+  if (!cc1101Ok) return;
+  sgCapture.valid = false;
+  sgWaveReady     = false;
+  sgListening     = true;
+  // Calibrate noise floor over 500ms
+  int sum = 0;
+  for (int i = 0; i < 20; i++) { sum += ELECHOUSE_cc1101.getRssi(); delay(25); }
+  sgNoiseFloor = sum / 20;
+  Serial.printf("[CC1101] Noise floor: %ddBm\n", sgNoiseFloor);
+  triggerReaction(MOOD_WORKING, "Sub-GHz", "listening...");
+}
+
+void stopSubGhz() {
+  sgListening = false;
+}
+
+// === NFC (PN532 via I2C) ===
+Adafruit_PN532 nfc532(255, 255);  // I2C mode, no IRQ/RST pins needed
+
+struct NfcCard {
+  char uid[22];
+  char type[22];
+  char network[14];
+  uint8_t sak;
+  bool valid;
+};
+NfcCard nfcCard = {"", "", "", 0, false};
+bool nfcReady = false;
+unsigned long nfcLastScan = 0;
+
+static const char* nfcNetworkFromAID(const uint8_t* aid, uint8_t len) {
+  if (len < 5) return nullptr;
+  if (memcmp(aid, "\xA0\x00\x00\x00\x03", 5) == 0) return "Visa";
+  if (memcmp(aid, "\xA0\x00\x00\x00\x04", 5) == 0) return "Mastercard";
+  if (memcmp(aid, "\xA0\x00\x00\x00\x25", 5) == 0) return "Amex";
+  if (memcmp(aid, "\xA0\x00\x00\x00\x65", 5) == 0) return "JCB";
+  if (memcmp(aid, "\xA0\x00\x00\x06\x86", 5) == 0) return "Interac";
+  return nullptr;
+}
+
+static void nfcTryEMVNetwork(NfcCard& card) {
+  // SELECT PPSE
+  uint8_t apdu[] = {
+    0x00, 0xA4, 0x04, 0x00, 0x0E,
+    '2','P','A','Y','.','S','Y','S','.','D','D','F','0','1',
+    0x00
+  };
+  uint8_t rsp[64]; uint8_t rspLen = sizeof(rsp);
+  if (!nfc532.inDataExchange(apdu, sizeof(apdu), rsp, &rspLen)) return;
+  if (rspLen < 4) return;
+
+  // BER-TLV parse: find tag 0x4F (AID)
+  uint8_t* p   = rsp;
+  uint8_t* end = rsp + rspLen - 2; // skip SW1/SW2
+  while (p < end - 1) {
+    uint8_t tag  = *p++;
+    uint8_t tlen = *p++;
+    if (p + tlen > end) break;
+    if (tag == 0x4F && tlen >= 5) {
+      const char* net = nfcNetworkFromAID(p, tlen);
+      if (net) { strncpy(card.network, net, 13); return; }
+    }
+    p += tlen;
+  }
+}
+
+void nfcReadCard() {
+  // Fast NACK check — endTransmission returns instantly if device absent
+  // avoids 6s blocking inside readPassiveTargetID on missing PN532
+  Wire.beginTransmission(0x24);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[NFC] PN532 not on bus (0x24)");
+    return;
+  }
+  uint8_t uid[7]; uint8_t uidLen = 0;
+  if (!nfc532.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) {
+    Serial.println("[NFC] No card");
+    return;
+  }
+
+  nfcCard.valid = true;
+  nfcCard.sak   = 0;
+  strncpy(nfcCard.network, "", 1);
+
+  // UID string
+  char* p = nfcCard.uid;
+  for (uint8_t i = 0; i < uidLen; i++) {
+    if (i) p += snprintf(p, 4, ":%02X", uid[i]);
+    else    p += snprintf(p, 3, "%02X",  uid[i]);
+  }
+
+  // Probe card type: try SELECT PPSE first (EMV/payment card)
+  nfcTryEMVNetwork(nfcCard);
+
+  if (strlen(nfcCard.network) > 0) {
+    strncpy(nfcCard.type, "EMV Payment", 21);
+  } else if (strlen(nfcCard.network) == 0) {
+    // Fallback: classify by UID length
+    // 4-byte → MIFARE Classic/Mini, 7-byte → MIFARE Ultralight/NTAG
+    // EMV cards also have 4/7 byte UIDs so check APDU result first (done above)
+    if (uidLen == 4) strncpy(nfcCard.type, "MIFARE Classic", 21);
+    else if (uidLen == 7) strncpy(nfcCard.type, "MIFARE Ultralt", 21);
+    else snprintf(nfcCard.type, 21, "ISO14443 %db", uidLen);
+  }
+
+  Serial.printf("[NFC] UID=%s type=%s network=%s\n",
+    nfcCard.uid, nfcCard.type, nfcCard.network);
+
+  if (strlen(nfcCard.network) > 0)
+    triggerReaction(MOOD_SUCCESS, nfcCard.network, nfcCard.uid);
+  else
+    triggerReaction(MOOD_HAPPY, nfcCard.type, nfcCard.uid);
+
+  nfcLastScan = millis();
+}
+
+void initNFC() {
+  nfc532.begin();
+  Wire.setTimeOut(80);  // after begin() so it isn't reset — limits each I2C call to 80ms
+  nfcReady = true;      // skip getFirmwareVersion() at boot, verified on first scan
+  Serial.println("[NFC] PN532 init done");
+}
+
 // === SD CARD ===
 bool sdAvailable = false;
 
@@ -909,6 +1132,107 @@ void drawPlaceholder(const char* title, const char* msg) {
   drawControls("bk:back"); display.sendBuffer();
 }
 
+void drawNFC() {
+  display.clearBuffer();
+  drawHeader("NFC Reader");
+  if (!nfcReady) {
+    display.setFont(u8g2_font_6x10_tr); display.drawStr(4,35,"MFRC522 not found");
+    display.setFont(u8g2_font_5x8_tr);  display.drawStr(4,50,"Check wiring GPIO27");
+    drawControls("bk:back"); display.sendBuffer(); return;
+  }
+  display.setFont(u8g2_font_5x8_tr);
+  if (!nfcCard.valid) {
+    display.setFont(u8g2_font_6x10_tr); display.drawStr(4,28,"Hold card");
+    display.drawStr(4,42,"to reader...");
+    int dots = (millis()/300)%4;
+    char d[5]="    "; for(int i=0;i<dots;i++) d[i]='.';
+    display.setFont(u8g2_font_5x8_tr); display.drawStr(4,55,d);
+  } else {
+    display.setFont(u8g2_font_5x8_tr);
+    // Card type (line 1)
+    char line1[22];
+    if (strlen(nfcCard.network) > 0)
+      snprintf(line1, sizeof(line1), "%s", nfcCard.network);
+    else
+      snprintf(line1, sizeof(line1), "%s", nfcCard.type);
+    display.drawStr(2, 27, line1);
+    // Sub-type (line 2) if network found
+    if (strlen(nfcCard.network) > 0)
+      display.drawStr(2, 37, nfcCard.type);
+    // UID (line 3)
+    char uidLine[22]; snprintf(uidLine, sizeof(uidLine), "%.21s", nfcCard.uid);
+    display.drawStr(2, 48, uidLine);
+    display.drawStr(2, 57, "ok:clear  bk:back");
+  }
+  drawControls("ok:clear  bk:back");
+  display.sendBuffer();
+}
+
+void drawSubGhz() {
+  display.clearBuffer();
+
+  if (!cc1101Ok) {
+    drawHeader("Sub-GHz");
+    display.setFont(u8g2_font_6x10_tr);
+    display.drawStr(4, 35, "CC1101 not found");
+    display.setFont(u8g2_font_5x8_tr);
+    display.drawStr(4, 50, "Check wiring (GPIO15)");
+    drawControls("bk:back");
+    display.sendBuffer();
+    return;
+  }
+
+  // Header with RSSI
+  display.setFont(u8g2_font_5x8_tr);
+  int rssi = cc1101Ok ? ELECHOUSE_cc1101.getRssi() : -99;
+  char hdr[32]; snprintf(hdr, sizeof(hdr), "433MHz  RSSI:%ddBm", rssi);
+  display.drawStr(2, 8, hdr);
+  display.drawHLine(0, 10, 128);
+
+  if (!sgCapture.valid) {
+    // Live RSSI bar
+    int rssiRaw = ELECHOUSE_cc1101.getRssi();  // typically -30 to -100
+    int barW = map(constrain(rssiRaw, -100, -20), -100, -20, 0, 100);
+    display.drawFrame(4, 14, 100, 7);
+    display.drawBox(4, 14, barW, 7);
+    char rssiStr[20]; snprintf(rssiStr, sizeof(rssiStr), "RSSI:%ddBm", rssiRaw);
+    display.setFont(u8g2_font_5x8_tr);
+    display.drawStr(106, 20, rssiStr[5] ? rssiStr : "");
+    display.drawStr(4, 20, rssiStr);
+
+    display.setFont(u8g2_font_6x10_tr);
+    display.drawStr(4, 38, "Listening...");
+    display.setFont(u8g2_font_5x8_tr);
+    int nowRssi = cc1101Ok ? ELECHOUSE_cc1101.getRssi() : -99;
+    char nf[32]; snprintf(nf, sizeof(nf), "Floor:%d Now:%d", sgNoiseFloor, nowRssi);
+    display.drawStr(2, 50, nf);
+    display.drawStr(4, 62, "Press remote now");
+  } else {
+    // Show pulse count
+    display.setFont(u8g2_font_6x10_tr);
+    char line1[32]; snprintf(line1, sizeof(line1), "Pulses: %d", sgPulseCount);
+    display.drawStr(2, 22, line1);
+    display.setFont(u8g2_font_5x8_tr);
+    display.drawStr(2, 32, "Rolling code");
+    display.drawStr(2, 41, "Waveform:");
+
+    // Waveform
+    if (sgWaveReady) {
+      int waveY = 56;
+      display.drawHLine(4, waveY, 120);
+      for (int i = 0; i < SG_WAVE_SAMPLES; i++) {
+        if (sgWave[i]) {
+          display.drawPixel(4 + i, waveY - 8);
+          display.drawVLine(4 + i, waveY - 8, 8);
+        }
+      }
+    }
+  }
+
+  drawControls(sgCapture.valid ? "ok:clear  bk:exit" : "ok:arm  bk:exit");
+  display.sendBuffer();
+}
+
 void drawAbout() {
   display.clearBuffer();
   // Left side: text (stays within x=0-80 to avoid mascot)
@@ -1113,7 +1437,7 @@ void handleInput(char input) {
           case 4: enterDeauthTargetSelect(); return;
           case 5: startBeaconSpam(); return;
           case 6: enterEvilTwinTarget(); return;
-          case 7: currentState=STATE_SUBGHZ; break;
+          case 7: currentState=STATE_SUBGHZ; startSubGhz(); return;
           case 8: currentState=STATE_NFC; break;
           case 9: currentState=STATE_IR; break;
           case 10: currentState=STATE_ABOUT; break;
@@ -1162,7 +1486,18 @@ void handleInput(char input) {
       break;
     case STATE_ET_RUNNING:
       if(input=='q') stopEvilTwin(); break;
-    case STATE_SUBGHZ: case STATE_NFC: case STATE_IR: case STATE_ABOUT:
+    case STATE_SUBGHZ:
+      if(input=='q') { stopSubGhz(); currentState=STATE_MENU; }
+      else if(input=='e') {
+        if (sgCapture.valid) { sgCapture.valid=false; sgWaveReady=false; }  // clear
+        else { sgArmed=true; sgArmTime=millis(); sgCapture.valid=false; sgWaveReady=false; }
+      }
+      break;
+    case STATE_NFC:
+      if(input=='q') { nfcCard.valid=false; currentState=STATE_MENU; }
+      else if(input=='e') nfcCard.valid=false;  // ok: clear result
+      break;
+    case STATE_IR: case STATE_ABOUT:
       if(input=='q') currentState=STATE_MENU; break;
     default: break;
   }
@@ -1178,6 +1513,8 @@ void setup() {
   esp_log_level_set("wifi", ESP_LOG_NONE);
   pinMode(PIN_CC_CS, OUTPUT);
   digitalWrite(PIN_CC_CS, HIGH);
+  initCC1101();
+  initNFC();
   initSD();
   initButtons();
   display.begin();
@@ -1290,6 +1627,22 @@ void loop() {
     if (millis()-lastEtDraw>2000) { drawEvilTwinRunning(); lastEtDraw=millis(); }
   }
 
+  if (currentState == STATE_NFC && nfcReady && millis() - nfcLastScan > 600) {
+    Wire.beginTransmission(0x24);
+    if (Wire.endTransmission() == 0) nfcReadCard();  // PN532 on bus → try read (50ms block)
+    nfcLastScan = millis();
+  }
+
+  if (currentState==STATE_SUBGHZ && sgListening && cc1101Ok && sgArmed) {
+    if (millis() - sgArmTime > 1500) {
+      sgArmed = false;
+      triggerReaction(MOOD_SAD, "No signal", "try again");
+    } else if (digitalRead(4)) {
+      captureRawSignal();
+      sgArmed = false;
+    }
+  }
+
   // === NORMAL SCREEN DRAW ===
   if (currentState!=STATE_PACKET_MONITOR &&
       currentState!=STATE_DEAUTH_ATTACK  &&
@@ -1304,8 +1657,8 @@ void loop() {
       case STATE_DEAUTH_CLIENT_SCAN:   drawClientScan(); break;
       case STATE_DEAUTH_CLIENT_SELECT: drawClientSelect(); break;
       case STATE_ET_TARGET:            drawEvilTwinTarget(); break;
-      case STATE_SUBGHZ:  drawPlaceholder("Sub-GHz",   "Wire CC1101 first"); break;
-      case STATE_NFC:     drawPlaceholder("NFC Reader", "Wire PN532 first"); break;
+      case STATE_SUBGHZ:  drawSubGhz(); break;
+      case STATE_NFC:     drawNFC(); break;
       case STATE_IR:      drawPlaceholder("IR Remote",  "Coming soon..."); break;
       case STATE_ABOUT:   drawAbout(); break;
       default: break;
